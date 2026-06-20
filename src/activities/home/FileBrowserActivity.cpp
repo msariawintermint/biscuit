@@ -93,9 +93,14 @@ void FileBrowserActivity::loadFiles() {
       files.emplace_back(std::string(name) + "/");
     } else {
       std::string_view filename{name};
-      if (FsHelpers::hasEpubExtension(filename) || FsHelpers::hasXtcExtension(filename) ||
-          FsHelpers::hasTxtExtension(filename) || FsHelpers::hasMarkdownExtension(filename) ||
-          FsHelpers::hasBmpExtension(filename)) {
+      if (mode == Mode::PickFirmware) {
+        // Firmware picker: only show .bin files.
+        if (FsHelpers::checkFileExtension(filename, ".bin")) {
+          files.emplace_back(filename);
+        }
+      } else if (FsHelpers::hasEpubExtension(filename) || FsHelpers::hasXtcExtension(filename) ||
+                 FsHelpers::hasTxtExtension(filename) || FsHelpers::hasMarkdownExtension(filename) ||
+                 FsHelpers::hasBmpExtension(filename)) {
         files.emplace_back(filename);
       }
     }
@@ -110,6 +115,28 @@ void FileBrowserActivity::onEnter() {
 
   loadFiles();
   selectorIndex = 0;
+
+  // If Confirm was held while this activity opened (typical when launched from a menu), ignore
+  // its release — otherwise we'd immediately auto-open whatever is at index 0.
+  lockNextConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
+
+  auto root = Storage.open(basepath.c_str());
+  if (!root) {
+    basepath = "/";
+    loadFiles();
+  } else if (!root.isDirectory()) {
+    lockLongPressBack = mappedInput.isPressed(MappedInputManager::Button::Back);
+
+    const std::string oldPath = basepath;
+    basepath = FsHelpers::extractFolderPath(basepath);
+    loadFiles();
+
+    const auto pos = oldPath.find_last_of('/');
+    const std::string fileName = oldPath.substr(pos + 1);
+    selectorIndex = findEntry(fileName);
+  } else {
+    loadFiles();
+  }
 
   requestUpdate();
 }
@@ -128,9 +155,10 @@ void FileBrowserActivity::clearFileMetadata(const std::string& fullPath) {
 }
 
 void FileBrowserActivity::loop() {
-  // Long press BACK (1s+) goes to root folder
-  if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= GO_HOME_MS &&
-      basepath != "/") {
+  // Long press BACK (1s+) goes to root folder (Books mode only).
+  // In firmware-pick mode we keep navigation simple: short Back = up dir / cancel.
+  if (mode == Mode::Books && mappedInput.isPressed(MappedInputManager::Button::Back) &&
+      mappedInput.getHeldTime() >= GO_HOME_MS && basepath != "/" && !lockLongPressBack) {
     basepath = "/";
     loadFiles();
     selectorIndex = 0;
@@ -140,12 +168,27 @@ void FileBrowserActivity::loop() {
   const int pageItems = UITheme::getInstance().getNumberOfItemsPerPage(renderer, true, false, true, false);
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (lockNextConfirmRelease) {
+      lockNextConfirmRelease = false;
+      return;
+    }
     if (files.empty()) return;
 
     const std::string& entry = files[selectorIndex];
     bool isDirectory = (entry.back() == '/');
 
-    if (mappedInput.getHeldTime() >= GO_HOME_MS && !isDirectory) {
+    // Firmware picker: select file -> return path; navigate into directories normally.
+    if (mode == Mode::PickFirmware && !isDirectory) {
+      std::string cleanBasePath = basepath;
+      if (cleanBasePath.back() != '/') cleanBasePath += "/";
+      ActivityResult res{FilePathResult{cleanBasePath + entry}};
+      res.isCancelled = false;
+      setResult(std::move(res));
+      finish();
+      return;
+    }
+
+    if (mode == Mode::Books && mappedInput.getHeldTime() >= GO_HOME_MS && !isDirectory) {
       // --- LONG PRESS ACTION: DELETE FILE ---
       std::string cleanBasePath = basepath;
       if (cleanBasePath.back() != '/') cleanBasePath += "/";
@@ -209,6 +252,12 @@ void FileBrowserActivity::loop() {
         selectorIndex = findEntry(dirName);
 
         requestUpdate();
+      } else if (mode == Mode::PickFirmware) {
+        // Firmware picker at root: cancel back to caller instead of going home.
+        ActivityResult res;
+        res.isCancelled = true;
+        setResult(std::move(res));
+        finish();
       } else {
         onGoHome();
       }
@@ -256,13 +305,17 @@ void FileBrowserActivity::render(RenderLock&&) {
   const auto pageHeight = renderer.getScreenHeight();
   const auto& metrics = UITheme::getInstance().getMetrics();
 
-  std::string folderName = (basepath == "/") ? tr(STR_SD_CARD) : basepath.substr(basepath.rfind('/') + 1);
+  std::string folderName =
+      (mode == Mode::PickFirmware)
+          ? std::string(tr(STR_SELECT_FIRMWARE_FILE))
+          : ((basepath == "/") ? std::string(tr(STR_SD_CARD)) : basepath.substr(basepath.rfind('/') + 1));
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, folderName.c_str());
 
   const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
   const int contentHeight = pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
   if (files.empty()) {
-    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, tr(STR_NO_FILES_FOUND));
+    const char* emptyMsg = (mode == Mode::PickFirmware) ? tr(STR_NO_BIN_FILES) : tr(STR_NO_FILES_FOUND);
+    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, emptyMsg);
   } else {
     GUI.drawList(
         renderer, Rect{0, contentTop, pageWidth, contentHeight}, files.size(), selectorIndex,
@@ -271,9 +324,12 @@ void FileBrowserActivity::render(RenderLock&&) {
   }
 
   // Help text
-  const auto labels =
-      mappedInput.mapLabels(basepath == "/" ? tr(STR_HOME) : tr(STR_BACK), files.empty() ? "" : tr(STR_OPEN),
-                            files.empty() ? "" : "^", files.empty() ? "" : "v");
+  const char* backLabel = (basepath == "/") ? (mode == Mode::PickFirmware ? tr(STR_BACK) : tr(STR_HOME)) : tr(STR_BACK);
+  // In PickFirmware mode, Confirm on a .bin returns the path to the caller (not "open"); show
+  // STR_SELECT instead. Directories in the same picker still descend, so keep STR_OPEN there.
+  const bool selectingFirmwareFile = mode == Mode::PickFirmware && !files.empty() && files[selectorIndex].back() != '/';
+  const char* confirmLabel = files.empty() ? "" : (selectingFirmwareFile ? tr(STR_SELECT) : tr(STR_OPEN));
+  const auto labels = mappedInput.mapLabels(backLabel, confirmLabel, files.empty() ? "" : "^", files.empty() ? "" : "v");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();
