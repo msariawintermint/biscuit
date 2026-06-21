@@ -55,4 +55,8 @@ inline bool hasTxtExtension(const String& fileName) {
 // Check for .md extension (case-insensitive)
 bool hasMarkdownExtension(std::string_view fileName);
 
+// Returns the parent folder of the given path (e.g. "/Books/foo.epub" -> "/Books").
+// Returns "/" if filePath has no folder component.
+std::string extractFolderPath(const std::string& filePath);
+
 }  // namespace FsHelpers
